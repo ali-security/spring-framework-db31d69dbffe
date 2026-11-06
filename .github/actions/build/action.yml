@@ -24,6 +24,10 @@ inputs:
     description: 'Whether to publish artifacts ready for deployment to Artifactory'
     required: false
     default: 'false'
+  test-filter:
+    description: 'Gradle test task selector; empty runs the full suite'
+    required: false
+    default: ''
 outputs:
   build-scan-url:
     description: 'URL, if any, of the build scan produced by the build'
@@ -42,16 +46,244 @@ runs:
         java-early-access: ${{ inputs.java-early-access }}
         java-toolchain: ${{ inputs.java-toolchain }}
         java-version: ${{ inputs.java-version }}
+    - name: Enable Test Result Logging
+      shell: bash
+      run: |
+        mkdir -p $HOME/.gradle/init.d
+        cat > $HOME/.gradle/init.d/seal-test-results.gradle <<'GRADLE'
+        allprojects {
+          tasks.withType(Test).configureEach { t ->
+            t.outputs.cacheIf { false }
+            t.outputs.upToDateWhen { false }
+            t.testLogging {
+              events 'skipped', 'failed'
+              exceptionFormat 'full'
+            }
+            def sealSkipFile = new File(t.project.rootDir, "build/seal-skipped/${t.path.replace(':', '_')}.tsv")
+            t.doFirst { sealSkipFile.delete() }
+            t.afterTest { desc, result ->
+              if (result.resultType.name() == 'SKIPPED') {
+                sealSkipFile.parentFile.mkdirs()
+                def msg = (result.exception?.message ?: '').replaceAll('[\\t\\r\\n]+', ' ')
+                sealSkipFile << "${t.path}\t${desc.className}\t${desc.name}\t${msg}\t${desc.parent?.name ?: ''}\n"
+              }
+            }
+            t.afterSuite { desc, result ->
+              if (desc.parent == null) {
+                println "TEST SUMMARY ${t.path}: tests=${result.testCount} passed=${result.successfulTestCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount} result=${result.resultType}"
+              }
+            }
+          }
+        }
+        GRADLE
     - name: Build
       id: build
       if: ${{ inputs.publish == 'false' }}
       shell: bash
-      run: ./gradlew check antora
+      run: |
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          ./gradlew assemble ${{ inputs.test-filter }}
+        else
+          ./gradlew check antora
+        fi
     - name: Publish
       id: publish
       if: ${{ inputs.publish == 'true' }}
       shell: bash
-      run: ./gradlew -PdeploymentRepository=$(pwd)/deployment-repository build publishAllPublicationsToDeploymentRepository
+      run: |
+        if [ -n "${{ inputs.test-filter }}" ]; then
+          ./gradlew -PdeploymentRepository=$(pwd)/deployment-repository assemble publishAllPublicationsToDeploymentRepository ${{ inputs.test-filter }}
+        else
+          ./gradlew -PdeploymentRepository=$(pwd)/deployment-repository build publishAllPublicationsToDeploymentRepository
+        fi
+    - name: Report Skipped Tests
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import glob, os, re
+        from collections import Counter
+        idx = {}
+        for f in glob.glob('**/src/*/*/**/*.java', recursive=True) + glob.glob('**/src/*/*/**/*.kt', recursive=True):
+            parts = f.split(os.sep)
+            i = parts.index('src')
+            if len(parts) > i + 3 and parts[i + 2] in ('java', 'kotlin'):
+                idx.setdefault('.'.join(parts[i + 3:]).rsplit('.', 1)[0], []).append(f)
+        ANN = re.compile(r'@(Disabled|Enabled|Ignore|IfProfileValue)\w*')
+        ASSUME = re.compile(r'\b(assume\w*|Assumptions\.\w+|Assume\.\w+)\s*\(')
+        cache = {}
+        def lines(f):
+            if f not in cache:
+                with open(f, encoding='utf-8', errors='replace') as h:
+                    cache[f] = h.read().splitlines()
+            return cache[f]
+        def anns_before(ls, i):
+            out = []
+            for j in range(i, max(-1, i - 9), -1):
+                s = ls[j].strip()
+                if j < i and (s.endswith('}') or s.endswith(';')):
+                    break
+                m = ANN.search(s)
+                if m:
+                    out.append(s[m.start():])
+            return out
+        def body_assumes(ls, i):
+            out, depth, started = [], 0, False
+            for k in range(i, min(len(ls), i + 80)):
+                l = ls[k]
+                if ASSUME.search(l):
+                    stmt = l.strip()
+                    n = k
+                    while not stmt.endswith(';') and n + 1 < len(ls) and n < k + 3:
+                        n += 1
+                        stmt += ' ' + ls[n].strip()
+                    out.append('assumption: ' + stmt)
+                depth += l.count('{') - l.count('}')
+                started = started or '{' in l
+                if started and depth <= 0:
+                    break
+            return out
+        def chain(cls):
+            top = cls.split('$')[0]
+            seen = []
+            while top in idx and top not in seen and len(seen) < 6:
+                seen.append(top)
+                ls = lines(idx[top][0])
+                name = top.split('.')[-1]
+                sup = None
+                for l in ls:
+                    m = re.search(r'\bclass\s+' + re.escape(name) + r'\b[^{]*?\bextends\s+([\w.]+)', l)
+                    if m:
+                        sup = m.group(1)
+                        break
+                    m = re.search(r'\bclass\s+' + re.escape(name) + r'\b.*\)\s*:\s*([\w.]+)\(', l)
+                    if m:
+                        sup = m.group(1)
+                        break
+                if not sup:
+                    break
+                if '.' not in sup:
+                    imp = [l for l in ls if re.match(r'\s*import\s+[\w.]+\.' + re.escape(sup) + r'\s*;?\s*$', l)]
+                    sup = re.sub(r'^\s*import\s+|\s*;?\s*$', '', imp[0]) if imp else top.rsplit('.', 1)[0] + '.' + sup
+                top = sup
+            return seen
+        def lifecycle_assumes(ls):
+            out = []
+            for i, l in enumerate(ls):
+                if re.search(r'@(BeforeAll|BeforeEach|BeforeClass|Before)\b', l):
+                    out += [a.replace('assumption:', 'assumption in @' + re.search(r'@(\w+)', l).group(1) + ':') for a in body_assumes(ls, i + 1)]
+            return out
+        import xml.etree.ElementTree as ET
+        from collections import defaultdict
+        passed = defaultdict(set)
+        passed_cls = defaultdict(Counter)
+        xmls = sorted(glob.glob('**/build/test-results/*/*.xml', recursive=True))
+        def task_of(x):
+            mod = '' if x.startswith('build' + os.sep) else x.split(os.sep + 'build' + os.sep)[0]
+            return (':' + mod.replace(os.sep, ':') if mod else '') + ':' + x.split(os.sep)[-2], mod or '.'
+        parsed = []
+        for x in xmls:
+            try:
+                r = ET.parse(x).getroot()
+            except Exception:
+                continue
+            parsed.append((x, r))
+            for tc in r.iter('testcase'):
+                if not list(tc) or all(ch.tag in ('system-out', 'system-err') for ch in tc):
+                    passed[(tc.get('classname', ''), tc.get('name', ''))].add(task_of(x)[0])
+                    passed_cls[tc.get('classname', '').split('$')[0]][task_of(x)[0]] += 1
+        def reason(cls, name, msg='', parent='', task=''):
+            elsewhere = sorted(t for t in passed.get((cls, name), ()) if t != task)
+            pre = ['same test ran and PASSED in ' + ', '.join(elsewhere)] if elsewhere else []
+            if not pre:
+                key = (cls if cls not in ('UnknownClass', '') else name).split('$')[0]
+                other = {t: n for t, n in passed_cls.get(key, {}).items() if t != task}
+                if other:
+                    pre = ['tests of ' + key.split('.')[-1] + ' ran and PASSED in ' + ', '.join(f'{t} ({n} passed)' for t, n in sorted(other.items()))]
+            if cls in ('UnknownClass', '') or not cls:
+                cls, name = name, ''
+            method = re.sub(r'[(\[].*$', '', name).strip()
+            if (not method or method.startswith('[')) and parent:
+                method = re.sub(r'[(\[].*$', '', parent).strip()
+            classes = chain(cls)
+            why = [msg] if msg else []
+            if method:
+                pat = re.compile(r'\b(void|fun)\s+`?' + re.escape(method) + r'\s*`?\s*\(')
+                for c in classes:
+                    ls = lines(idx[c][0])
+                    hits = [i for i, l in enumerate(ls) if pat.search(l)]
+                    am = re.search(r'\(([^)]*)\)', name) or re.search(r'\(([^)]*)\)', parent or '')
+                    if am and len(hits) > 1:
+                        ar = len([q for q in am.group(1).split(',') if q.strip()])
+                        def decl_arity(i):
+                            d = ls[i][ls[i].index('(') + 1:].split(')')[0]
+                            return len([q for q in d.split(',') if q.strip()])
+                        hits = [i for i in hits if decl_arity(i) == ar] or hits
+                    if hits:
+                        why += anns_before(ls, hits[0]) + body_assumes(ls, hits[0])
+                        break
+            nested = cls.split('$')[1:]
+            for c in classes:
+                ls = lines(idx[c][0])
+                for n in [c.split('.')[-1]] + (nested if c == classes[0] else []):
+                    for i, l in enumerate(ls):
+                        if re.search(r'\b(class|interface)\s+' + re.escape(n) + r'\b', l):
+                            why += ['class-level ' + a + ' (on ' + n + ')' for a in anns_before(ls, i)]
+                            break
+                why += lifecycle_assumes(ls)
+            why = pre + why
+            return '; '.join(dict.fromkeys(why)) or 'no source annotation located (skipped by an upstream JUnit execution condition at runtime; no test filter applied by this build)'
+        counts = Counter()
+        tsv_rows = defaultdict(list)
+        for tsv in sorted(glob.glob('build/seal-skipped/*.tsv')):
+            with open(tsv, encoding='utf-8') as h:
+                for row in h:
+                    task, cls, name, msg, parent = (row.rstrip('\n').split('\t') + ['', '', '', '', ''])[:5]
+                    tsv_rows[(task, cls)].append(name)
+                    counts[task] += 1
+                    print(f'SKIPPED TEST {task} {cls} > {name} reason: {reason(cls, name, msg, parent, task)}')
+        for x, r in parsed:
+            task = task_of(x)[0]
+            per_cls = defaultdict(list)
+            for tc in r.iter('testcase'):
+                sk = tc.find('skipped')
+                if sk is not None:
+                    per_cls[tc.get('classname', '')].append((tc.get('name', ''), (sk.get('message') or '').replace('\n', ' ').strip()))
+            for cls, items in per_cls.items():
+                have = tsv_rows.get((task, cls), [])
+                extra = len(items) - len(have)
+                if extra <= 0:
+                    continue
+                cand = [it for it in items if it[0] not in have] or items
+                cand = sorted(cand, key=lambda it: it[0].startswith('['))
+                for name, msg in cand[:extra]:
+                    counts[task] += 1
+                    print(f'SKIPPED TEST {task} {cls} > {name} reason: {reason(cls, name, msg, "", task)}')
+        def mod_of(task):
+            return task.rsplit(':', 1)[0].lstrip(':').replace(':', os.sep) or '.'
+        listed_mod = Counter()
+        by_task = defaultdict(list)
+        for task, c in sorted(counts.items()):
+            listed_mod[mod_of(task)] += c
+            by_task[mod_of(task)].append(f'{task}={c}')
+        for mod, c in sorted(listed_mod.items()):
+            print(f"SKIPPED TESTS LISTED FOR MODULE {mod}: {c} (summed over its test tasks: {' + '.join(by_task[mod])})")
+        print(f'SKIPPED TESTS WITH REASONS (all modules, all test tasks): {sum(counts.values())}')
+        mods, grand = {}, Counter()
+        for x, r in parsed:
+            mod = task_of(x)[1]
+            t, f, e, sk = (int(r.get(k, 0)) for k in ('tests', 'failures', 'errors', 'skipped'))
+            for c in (mods.setdefault(mod, Counter()), grand):
+                c['tests'] += t
+                c['failed'] += f + e
+                c['skipped'] += sk
+                c['passed'] += t - f - e - sk
+        for mod, c in sorted(mods.items()):
+            extra = f" skipped_listed_with_reasons={listed_mod.get(mod, 0)} ({' + '.join(by_task[mod])})" if c['skipped'] or listed_mod.get(mod) else ''
+            print(f"JUNIT XML TOTALS {mod}: tests={c['tests']} passed={c['passed']} failed={c['failed']} skipped={c['skipped']}{extra}")
+        print(f"JUNIT XML GRAND TOTAL: tests={grand['tests']} passed={grand['passed']} failed={grand['failed']} skipped={grand['skipped']}")
+        print(f"SKIP RECONCILIATION TOTAL: junit_xml_skipped={grand['skipped']} listed_with_reasons={sum(counts.values())} unlisted={max(0, grand['skipped'] - sum(counts.values()))}")
+        PY
     - name: Read Version From gradle.properties
       id: read-version
       shell: bash
